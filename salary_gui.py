@@ -260,7 +260,6 @@ try:
 except Exception:
     conn = None
 
-# 首次启动时自动从云端恢复基础设置，解决刷新后队伍名称和数量丢失问题
 if conn is not None and not st.session_state.cloud_config_loaded:
     ok, msg = load_basic_config_from_cloud(conn)
     st.session_state.cloud_config_loaded = True
@@ -272,11 +271,10 @@ for i, row in events_df.iterrows():
         default_event_idx = int(i)
         break
 
-# ===== 侧边栏最上方先放云端存档按钮 =====
 st.sidebar.header("☁️ 云端存档 (Google Sheets)")
-cloud_top_container = st.sidebar.container()
+cloud_button_container = st.sidebar.container()
+cloud_msg = st.sidebar.empty()
 
-# ===== 再放活动与队伍 =====
 st.sidebar.header("🗓️ 活动与队伍")
 selected_display_name = st.sidebar.selectbox(
     "选择排期活动",
@@ -322,7 +320,11 @@ with st.sidebar.expander("✏️ 队伍名称设置", expanded=False):
                 st.session_state.team_roles[team_key] = get_default_roles(team_key)
 
         if conn is not None:
-            save_basic_config_to_cloud(conn)
+            ok, msg = save_basic_config_to_cloud(conn)
+            if ok:
+                cloud_msg.success(msg)
+            else:
+                cloud_msg.error(msg)
 
         valid_team_keys = get_team_keys()
         if st.session_state.selected_team_key not in valid_team_keys:
@@ -343,14 +345,14 @@ with st.sidebar.expander("✏️ 队伍名称设置", expanded=False):
 
     if st.button("💾 保存队伍基础设置到云端", use_container_width=True):
         if conn is None:
-            st.warning("云端存储未配置！请检查 Secrets。")
+            cloud_msg.warning("云端存储未配置！请检查 Secrets。")
         else:
             ok, msg = save_basic_config_to_cloud(conn)
             if ok:
-                st.success(msg)
+                cloud_msg.success(msg)
                 st.rerun()
             else:
-                st.error(msg)
+                cloud_msg.error(msg)
 
 current_view = f"{selected_event_name}_{selected_team_key}"
 save_key = current_view
@@ -414,11 +416,10 @@ if current_view not in st.session_state.latest_schedules or not st.session_state
         df.copy() for df in st.session_state.base_schedules[current_view]
     ]
 
-# ===== 真正把按钮也放到最上面的 container 里 =====
-with cloud_top_container:
+with cloud_button_container:
     if st.button("☁️ 云端读取当前队伍", use_container_width=True):
         if conn is None:
-            st.sidebar.error("云端存储未配置！请检查 Secrets。")
+            cloud_msg.error("云端存储未配置！请检查 Secrets。")
         else:
             try:
                 cloud_df = conn.read(worksheet="saves", ttl=0)
@@ -434,42 +435,44 @@ with cloud_top_container:
                         if ekey in st.session_state:
                             del st.session_state[ekey]
 
-                    st.sidebar.success("云端读档成功，页面即将刷新")
+                    cloud_msg.success("云端读档成功，页面即将刷新")
                     st.rerun()
                 else:
-                    st.sidebar.warning("云端没有找到该活动和队伍的存档")
+                    cloud_msg.warning("云端没有找到该活动和队伍的存档")
             except Exception as e:
-                st.sidebar.error(f"云端读档失败：{e}")
+                cloud_msg.error(f"云端读档失败：{e}")
 
     if st.button("☁️ 云端保存当前队伍", use_container_width=True):
         if conn is None:
-            st.sidebar.error("云端存储未配置！请检查 Secrets。")
+            cloud_msg.error("云端存储未配置！请检查 Secrets。")
         else:
             try:
-                save_basic_config_to_cloud(conn)
+                ok, msg = save_basic_config_to_cloud(conn)
+                if not ok:
+                    cloud_msg.error(msg)
+                else:
+                    cloud_df = conn.read(worksheet="saves", ttl=0)
+                    cloud_df = ensure_sheet_columns(cloud_df)
 
-                cloud_df = conn.read(worksheet="saves", ttl=0)
-                cloud_df = ensure_sheet_columns(cloud_df)
+                    current_data_json = json.dumps(get_full_save_data(), ensure_ascii=False)
+                    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                current_data_json = json.dumps(get_full_save_data(), ensure_ascii=False)
-                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    new_row = pd.DataFrame([{
+                        "save_key": save_key,
+                        "event_name": selected_event_name,
+                        "team_key": selected_team_key,
+                        "team_name": selected_team_name,
+                        "updated_at": now_str,
+                        "data_json": current_data_json
+                    }])
 
-                new_row = pd.DataFrame([{
-                    "save_key": save_key,
-                    "event_name": selected_event_name,
-                    "team_key": selected_team_key,
-                    "team_name": selected_team_name,
-                    "updated_at": now_str,
-                    "data_json": current_data_json
-                }])
+                    cloud_df = cloud_df[cloud_df["save_key"] != save_key]
+                    cloud_df = pd.concat([cloud_df, new_row], ignore_index=True)
 
-                cloud_df = cloud_df[cloud_df["save_key"] != save_key]
-                cloud_df = pd.concat([cloud_df, new_row], ignore_index=True)
-
-                conn.update(worksheet="saves", data=cloud_df)
-                st.sidebar.success("云端保存成功（含基础设置）")
+                    conn.update(worksheet="saves", data=cloud_df)
+                    cloud_msg.success("云端保存成功（含基础设置）")
             except Exception as e:
-                st.sidebar.error(f"云端保存失败：{e}")
+                cloud_msg.error(f"云端保存失败：{e}")
 
 if st.sidebar.button("⚠️ 清空所有数据", type="primary", width="stretch"):
     for key in [
