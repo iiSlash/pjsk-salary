@@ -15,8 +15,10 @@ DEFAULT_TEAM_ROLES = {
     "队伍F": ["代跑", "审核"]
 }
 
+
 def get_default_roles(team_name):
     return DEFAULT_TEAM_ROLES.get(team_name, ["默认工种"])
+
 
 def get_save_data():
     save_data = {
@@ -32,6 +34,7 @@ def get_save_data():
             save_data["days"][k] = v
     return save_data
 
+
 def apply_save_data(data):
     st.session_state.team_roles = data.get("team_roles", {})
     loaded_schedules = {}
@@ -44,6 +47,7 @@ def apply_save_data(data):
     for k, v in data.get("days", {}).items():
         st.session_state[k] = v
 
+
 def ensure_sheet_columns(df):
     required_cols = ["save_key", "event_name", "team_name", "updated_at", "data_json"]
     if df is None or df.empty:
@@ -53,6 +57,7 @@ def ensure_sheet_columns(df):
             df[col] = ""
     return df[required_cols]
 
+
 if "base_schedules" not in st.session_state:
     st.session_state.base_schedules = {}
 if "latest_schedules" not in st.session_state:
@@ -61,6 +66,7 @@ if "last_view" not in st.session_state:
     st.session_state.last_view = None
 if "team_roles" not in st.session_state:
     st.session_state.team_roles = {}
+
 
 @st.cache_data(ttl=43200)
 def fetch_pjsk_cn_events():
@@ -76,7 +82,7 @@ def fetch_pjsk_cn_events():
             response = urllib.request.urlopen(req, timeout=5)
             events_data = json.loads(response.read().decode("utf-8"))
             break
-        except:
+        except Exception:
             continue
 
     if events_data is None:
@@ -103,6 +109,7 @@ def fetch_pjsk_cn_events():
             "天数": days
         })
     return pd.DataFrame(parsed_events)
+
 
 events_df = fetch_pjsk_cn_events()
 
@@ -191,9 +198,10 @@ for i in range(len(base_list)):
 
 st.session_state.base_schedules[current_view] = base_list
 
-# 保证 latest_schedules 至少有基础数据，避免第一次导出为空
 if current_view not in st.session_state.latest_schedules or not st.session_state.latest_schedules[current_view]:
-    st.session_state.latest_schedules[current_view] = [df.copy() for df in st.session_state.base_schedules[current_view]]
+    st.session_state.latest_schedules[current_view] = [
+        df.copy() for df in st.session_state.base_schedules[current_view]
+    ]
 
 st.sidebar.header("☁️ 云端存档 (Google Sheets)")
 
@@ -319,6 +327,7 @@ with st.expander("📁 排班表 Excel 导入与导出 (方便本地修改)", ex
                                     for r in team_roles:
                                         if r in imported_df.columns:
                                             clean_df.at[t, r] = imported_df.at[t, r]
+
                         new_schedules.append(clean_df)
 
                     st.session_state.base_schedules[current_view] = new_schedules
@@ -339,11 +348,17 @@ current_edited = []
 
 for i, tab in enumerate(tabs):
     with tab:
+        df_for_edit = st.session_state.base_schedules[current_view][i]
+
+        # 让表格尽量完整展开显示，避免内部滚动条
+        # 24行排班 + 表头，按每行约35像素计算
+        editor_height = int((len(df_for_edit) + 1) * 35 + 6)
+
         edited_df = st.data_editor(
-            st.session_state.base_schedules[current_view][i],
+            df_for_edit,
             key=f"editor_{current_view}_day_{i}",
             width="stretch",
-            height="stretch"
+            height=editor_height
         )
         current_edited.append(edited_df)
 
