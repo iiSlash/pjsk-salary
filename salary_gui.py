@@ -109,7 +109,10 @@ events_df = fetch_pjsk_cn_events()
 st.set_page_config(page_title="PJSK 多队伍排班系统", layout="wide")
 st.title("🎵 PJSK 简中服 - 多队伍动态排班系统")
 
-conn = st.connection("gsheets", type=GSheetsConnection)
+try:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+except Exception:
+    conn = None
 
 current_dt = datetime.datetime.now()
 default_event_idx = 0
@@ -188,47 +191,60 @@ for i in range(len(base_list)):
 
 st.session_state.base_schedules[current_view] = base_list
 
-st.sidebar.header("☁️ 云端存档")
+st.sidebar.header("☁️ 云端存档 (Google Sheets)")
 
 if st.sidebar.button("☁️ 云端读取当前队伍", use_container_width=True):
-    try:
-        cloud_df = conn.read(worksheet="saves", ttl=0)
-        cloud_df = ensure_sheet_columns(cloud_df)
-        matched = cloud_df[cloud_df["save_key"] == save_key]
-        if not matched.empty:
-            latest_row = matched.iloc[-1]
-            loaded_data = json.loads(latest_row["data_json"])
-            apply_save_data(loaded_data)
-            st.sidebar.success("云端读档成功，页面即将刷新")
-            st.rerun()
-        else:
-            st.sidebar.warning("云端没有找到该活动和队伍的存档")
-    except Exception as e:
-        st.sidebar.error(f"云端读档失败：{e}")
+    if conn is None:
+        st.sidebar.error("云端存储未配置！请检查 Secrets。")
+    else:
+        try:
+            cloud_df = conn.read(worksheet="saves", ttl=0)
+            cloud_df = ensure_sheet_columns(cloud_df)
+            matched = cloud_df[cloud_df["save_key"] == save_key]
+            if not matched.empty:
+                latest_row = matched.iloc[-1]
+                loaded_data = json.loads(latest_row["data_json"])
+                apply_save_data(loaded_data)
+                
+                # 清理编辑器缓存强制刷新
+                for i in range(30):
+                    ekey = f"editor_{current_view}_day_{i}"
+                    if ekey in st.session_state:
+                        del st.session_state[ekey]
+                        
+                st.sidebar.success("云端读档成功，页面即将刷新")
+                st.rerun()
+            else:
+                st.sidebar.warning("云端没有找到该活动和队伍的存档")
+        except Exception as e:
+            st.sidebar.error(f"云端读档失败：{e}")
 
 if st.sidebar.button("☁️ 云端保存当前队伍", use_container_width=True):
-    try:
-        cloud_df = conn.read(worksheet="saves", ttl=0)
-        cloud_df = ensure_sheet_columns(cloud_df)
+    if conn is None:
+        st.sidebar.error("云端存储未配置！请检查 Secrets。")
+    else:
+        try:
+            cloud_df = conn.read(worksheet="saves", ttl=0)
+            cloud_df = ensure_sheet_columns(cloud_df)
 
-        current_data_json = json.dumps(get_save_data(), ensure_ascii=False)
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            current_data_json = json.dumps(get_save_data(), ensure_ascii=False)
+            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        new_row = pd.DataFrame([{
-            "save_key": save_key,
-            "event_name": selected_event_name,
-            "team_name": selected_team,
-            "updated_at": now_str,
-            "data_json": current_data_json
-        }])
+            new_row = pd.DataFrame([{
+                "save_key": save_key,
+                "event_name": selected_event_name,
+                "team_name": selected_team,
+                "updated_at": now_str,
+                "data_json": current_data_json
+            }])
 
-        cloud_df = cloud_df[cloud_df["save_key"] != save_key]
-        cloud_df = pd.concat([cloud_df, new_row], ignore_index=True)
+            cloud_df = cloud_df[cloud_df["save_key"] != save_key]
+            cloud_df = pd.concat([cloud_df, new_row], ignore_index=True)
 
-        conn.update(worksheet="saves", data=cloud_df)
-        st.sidebar.success("云端保存成功")
-    except Exception as e:
-        st.sidebar.error(f"云端保存失败：{e}")
+            conn.update(worksheet="saves", data=cloud_df)
+            st.sidebar.success("云端保存成功")
+        except Exception as e:
+            st.sidebar.error(f"云端保存失败：{e}")
 
 if st.sidebar.button("⚠️ 清空所有数据", type="primary", width="stretch"):
     for key in ["base_schedules", "latest_schedules", "team_roles"]:
@@ -246,20 +262,74 @@ rates = {}
 for role in team_roles:
     with st.sidebar.expander(f"[{role}] 工价", expanded=False):
         rates[role] = {
-            "day": st.number_input(
-                f"{role} 白班价",
-                value=20,
-                key=f"{selected_team}_{role}_day"
-            ),
-            "night": st.number_input(
-                f"{role} 夜班价",
-                value=30,
-                key=f"{selected_team}_{role}_night"
-            )
+            "day": st.number_input(f"{role} 白班价", value=20, key=f"{selected_team}_{role}_day"),
+            "night": st.number_input(f"{role} 夜班价", value=30, key=f"{selected_team}_{role}_night")
         }
 
+# ================= 主界面表格区 =================
 st.header(f"📅 【{selected_event_name}】 - {selected_team}")
 st.caption(f"当前工种：{' / '.join(team_roles)}")
+
+# --- 新增：Excel 排班表导入导出功能 ---
+with st.expander("📁 排班表 Excel 导入与导出 (方便本地修改)", expanded=False):
+    st.info("💡 建议先下载当前空表（或已排好的表）作为模板。在 Excel 里修改后，再上传覆盖当前网页内容。")
+    col_ex, col_im = st.columns(2)
+    
+    with col_ex:
+        # 生成下载用的 Excel
+        schedule_excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(schedule_excel_buffer, engine="openpyxl") as writer:
+            for i, df in enumerate(st.session_state.latest_schedules[current_view]):
+                df.to_excel(writer, sheet_name=f"第{i+1}天")
+        schedule_excel_bytes = schedule_excel_buffer.getvalue()
+        safe_filename = "".join(x for x in selected_event_name if x.isalnum() or x in " -_")
+        
+        st.download_button(
+            "📥 下载排班表模板 (Excel)",
+            data=schedule_excel_bytes,
+            file_name=f"排班表_{safe_filename}_{selected_team}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
+    with col_im:
+        # 上传修改后的 Excel
+        uploaded_schedule = st.file_uploader("📂 上传填好的排班表并覆盖", type=["xlsx"])
+        if uploaded_schedule is not None:
+            if st.button("🚀 确认导入并覆盖", use_container_width=True):
+                try:
+                    xls = pd.read_excel(uploaded_schedule, sheet_name=None, index_col=0)
+                    new_schedules = []
+                    
+                    # 循环读取当前天数，避免多读或少读
+                    for i in range(current_days):
+                        sheet_name = f"第{i+1}天"
+                        clean_df = pd.DataFrame("", index=time_slots, columns=team_roles)
+                        
+                        if sheet_name in xls:
+                            imported_df = xls[sheet_name].fillna("").astype(str)
+                            # 按照网页要求的时间段和工种进行对齐安全过滤
+                            for t in time_slots:
+                                if t in imported_df.index:
+                                    for r in team_roles:
+                                        if r in imported_df.columns:
+                                            clean_df.at[t, r] = imported_df.at[t, r]
+                        new_schedules.append(clean_df)
+
+                    st.session_state.base_schedules[current_view] = new_schedules
+                    st.session_state.latest_schedules[current_view] = [df.copy() for df in new_schedules]
+
+                    # 强制清空缓存，保证网页表格刷新
+                    for i in range(current_days):
+                        editor_key = f"editor_{current_view}_day_{i}"
+                        if editor_key in st.session_state:
+                            del st.session_state[editor_key]
+
+                    st.success("导入覆盖成功，页面即将刷新！")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"导入失败，请检查文件是否被破坏：{e}")
+# ------------------------------------
 
 tabs = st.tabs([f"第 {i+1} 天" for i in range(current_days)])
 current_edited = []
@@ -276,6 +346,7 @@ for i, tab in enumerate(tabs):
 
 st.session_state.latest_schedules[current_view] = current_edited
 
+# ================= 工资汇总 =================
 st.header(f"📊 {selected_team} 工资汇总")
 
 if st.button(f"🚀 计算【{selected_team}】工资", type="primary", width="stretch"):
@@ -297,21 +368,14 @@ if st.button(f"🚀 计算【{selected_team}】工资", type="primary", width="s
                 name = str(name).strip()
 
                 if name not in salary_data:
-                    salary_data[name] = {
-                        "total_hours": 0,
-                        "total_salary": 0
-                    }
+                    salary_data[name] = {"total_hours": 0, "total_salary": 0}
 
                 salary_data[name]["total_hours"] += 1
                 salary_data[name]["total_salary"] += rates[role]["night" if is_night_shift else "day"]
 
     if salary_data:
         result_df = pd.DataFrame([
-            {
-                "姓名": k,
-                "总工时(小时)": v["total_hours"],
-                "总工资(元)": v["total_salary"]
-            }
+            {"姓名": k, "总工时(小时)": v["total_hours"], "总工资(元)": v["total_salary"]}
             for k, v in salary_data.items()
         ]).sort_values(by="总工资(元)", ascending=False).reset_index(drop=True)
 
