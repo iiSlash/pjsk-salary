@@ -191,6 +191,10 @@ for i in range(len(base_list)):
 
 st.session_state.base_schedules[current_view] = base_list
 
+# 保证 latest_schedules 至少有基础数据，避免第一次导出为空
+if current_view not in st.session_state.latest_schedules or not st.session_state.latest_schedules[current_view]:
+    st.session_state.latest_schedules[current_view] = [df.copy() for df in st.session_state.base_schedules[current_view]]
+
 st.sidebar.header("☁️ 云端存档 (Google Sheets)")
 
 if st.sidebar.button("☁️ 云端读取当前队伍", use_container_width=True):
@@ -205,13 +209,12 @@ if st.sidebar.button("☁️ 云端读取当前队伍", use_container_width=True
                 latest_row = matched.iloc[-1]
                 loaded_data = json.loads(latest_row["data_json"])
                 apply_save_data(loaded_data)
-                
-                # 清理编辑器缓存强制刷新
+
                 for i in range(30):
                     ekey = f"editor_{current_view}_day_{i}"
                     if ekey in st.session_state:
                         del st.session_state[ekey]
-                        
+
                 st.sidebar.success("云端读档成功，页面即将刷新")
                 st.rerun()
             else:
@@ -266,24 +269,29 @@ for role in team_roles:
             "night": st.number_input(f"{role} 夜班价", value=30, key=f"{selected_team}_{role}_night")
         }
 
-# ================= 主界面表格区 =================
 st.header(f"📅 【{selected_event_name}】 - {selected_team}")
 st.caption(f"当前工种：{' / '.join(team_roles)}")
 
-# --- 新增：Excel 排班表导入导出功能 ---
 with st.expander("📁 排班表 Excel 导入与导出 (方便本地修改)", expanded=False):
     st.info("💡 建议先下载当前空表（或已排好的表）作为模板。在 Excel 里修改后，再上传覆盖当前网页内容。")
     col_ex, col_im = st.columns(2)
-    
+
     with col_ex:
-        # 生成下载用的 Excel
         schedule_excel_buffer = io.BytesIO()
+        schedule_source = st.session_state.base_schedules.get(current_view, [])
+
         with pd.ExcelWriter(schedule_excel_buffer, engine="openpyxl") as writer:
-            for i, df in enumerate(st.session_state.latest_schedules[current_view]):
-                df.to_excel(writer, sheet_name=f"第{i+1}天")
+            if schedule_source:
+                for i, df in enumerate(schedule_source):
+                    export_df = df.copy()
+                    export_df.to_excel(writer, sheet_name=f"第{i+1}天")
+            else:
+                empty_df = pd.DataFrame("", index=time_slots, columns=team_roles)
+                empty_df.to_excel(writer, sheet_name="第1天")
+
         schedule_excel_bytes = schedule_excel_buffer.getvalue()
         safe_filename = "".join(x for x in selected_event_name if x.isalnum() or x in " -_")
-        
+
         st.download_button(
             "📥 下载排班表模板 (Excel)",
             data=schedule_excel_bytes,
@@ -293,22 +301,19 @@ with st.expander("📁 排班表 Excel 导入与导出 (方便本地修改)", ex
         )
 
     with col_im:
-        # 上传修改后的 Excel
         uploaded_schedule = st.file_uploader("📂 上传填好的排班表并覆盖", type=["xlsx"])
         if uploaded_schedule is not None:
             if st.button("🚀 确认导入并覆盖", use_container_width=True):
                 try:
                     xls = pd.read_excel(uploaded_schedule, sheet_name=None, index_col=0)
                     new_schedules = []
-                    
-                    # 循环读取当前天数，避免多读或少读
+
                     for i in range(current_days):
                         sheet_name = f"第{i+1}天"
                         clean_df = pd.DataFrame("", index=time_slots, columns=team_roles)
-                        
+
                         if sheet_name in xls:
                             imported_df = xls[sheet_name].fillna("").astype(str)
-                            # 按照网页要求的时间段和工种进行对齐安全过滤
                             for t in time_slots:
                                 if t in imported_df.index:
                                     for r in team_roles:
@@ -319,7 +324,6 @@ with st.expander("📁 排班表 Excel 导入与导出 (方便本地修改)", ex
                     st.session_state.base_schedules[current_view] = new_schedules
                     st.session_state.latest_schedules[current_view] = [df.copy() for df in new_schedules]
 
-                    # 强制清空缓存，保证网页表格刷新
                     for i in range(current_days):
                         editor_key = f"editor_{current_view}_day_{i}"
                         if editor_key in st.session_state:
@@ -329,7 +333,6 @@ with st.expander("📁 排班表 Excel 导入与导出 (方便本地修改)", ex
                     st.rerun()
                 except Exception as e:
                     st.error(f"导入失败，请检查文件是否被破坏：{e}")
-# ------------------------------------
 
 tabs = st.tabs([f"第 {i+1} 天" for i in range(current_days)])
 current_edited = []
@@ -346,7 +349,6 @@ for i, tab in enumerate(tabs):
 
 st.session_state.latest_schedules[current_view] = current_edited
 
-# ================= 工资汇总 =================
 st.header(f"📊 {selected_team} 工资汇总")
 
 if st.button(f"🚀 计算【{selected_team}】工资", type="primary", width="stretch"):
