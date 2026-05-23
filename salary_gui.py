@@ -6,8 +6,6 @@ import json
 import io
 from streamlit_gsheets import GSheetsConnection
 
-DEFAULT_TEAM_KEYS = ["team_1", "team_2", "team_3", "team_4", "team_5", "team_6"]
-
 DEFAULT_TEAM_NAMES = {
     "team_1": "队伍A",
     "team_2": "队伍B",
@@ -27,25 +25,45 @@ DEFAULT_TEAM_ROLES = {
 }
 
 
-def init_team_names():
-    if "team_names" not in st.session_state:
-        st.session_state.team_names = DEFAULT_TEAM_NAMES.copy()
-    else:
-        for key in DEFAULT_TEAM_KEYS:
-            if key not in st.session_state.team_names:
-                st.session_state.team_names[key] = DEFAULT_TEAM_NAMES[key]
+def make_team_key(i: int):
+    return f"team_{i}"
+
+
+def get_default_team_name(team_key):
+    return DEFAULT_TEAM_NAMES.get(team_key, f"队伍{team_key.split('_')[-1]}")
 
 
 def get_default_roles(team_key):
     return DEFAULT_TEAM_ROLES.get(team_key, ["默认工种"])
 
 
+def init_team_config():
+    if "team_count" not in st.session_state:
+        st.session_state.team_count = 6
+
+    if "team_names" not in st.session_state:
+        st.session_state.team_names = {}
+
+    for i in range(1, st.session_state.team_count + 1):
+        team_key = make_team_key(i)
+        if team_key not in st.session_state.team_names:
+            st.session_state.team_names[team_key] = get_default_team_name(team_key)
+
+    if "team_roles" not in st.session_state:
+        st.session_state.team_roles = {}
+
+
+def get_team_keys():
+    return [make_team_key(i) for i in range(1, st.session_state.team_count + 1)]
+
+
 def get_team_name(team_key):
-    return st.session_state.team_names.get(team_key, team_key)
+    return st.session_state.team_names.get(team_key, get_default_team_name(team_key))
 
 
 def get_save_data():
     save_data = {
+        "team_count": st.session_state.get("team_count", 6),
         "team_roles": st.session_state.get("team_roles", {}),
         "team_names": st.session_state.get("team_names", {}),
         "latest_schedules": {},
@@ -61,8 +79,16 @@ def get_save_data():
 
 
 def apply_save_data(data):
+    st.session_state.team_count = int(data.get("team_count", 6))
+    st.session_state.team_names = data.get("team_names", {})
     st.session_state.team_roles = data.get("team_roles", {})
-    st.session_state.team_names = data.get("team_names", DEFAULT_TEAM_NAMES.copy())
+
+    for i in range(1, st.session_state.team_count + 1):
+        team_key = make_team_key(i)
+        if team_key not in st.session_state.team_names:
+            st.session_state.team_names[team_key] = get_default_team_name(team_key)
+        if team_key not in st.session_state.team_roles:
+            st.session_state.team_roles[team_key] = get_default_roles(team_key)
 
     loaded_schedules = {}
     for k, v in data.get("latest_schedules", {}).items():
@@ -113,10 +139,9 @@ if "latest_schedules" not in st.session_state:
     st.session_state.latest_schedules = {}
 if "last_view" not in st.session_state:
     st.session_state.last_view = None
-if "team_roles" not in st.session_state:
-    st.session_state.team_roles = {}
 
-init_team_names()
+init_team_config()
+
 
 @st.cache_data(ttl=43200)
 def fetch_pjsk_cn_events():
@@ -178,35 +203,62 @@ for i, row in events_df.iterrows():
         default_event_idx = int(i)
         break
 
+st.sidebar.header("☁️ 云端存档 (Google Sheets)")
+
 st.sidebar.header("🗓️ 活动与队伍")
 selected_display_name = st.sidebar.selectbox(
     "选择排期活动",
     events_df["显示名称"].tolist(),
-    index=default_event_idx
+    index=default_event_idx,
+    key="selected_display_name"
 )
 event_info = events_df[events_df["显示名称"] == selected_display_name].iloc[0]
 selected_event_name = event_info["活动名称"]
 default_days = int(event_info["天数"])
 
-st.sidebar.header("✏️ 队伍名称设置")
-for team_key in DEFAULT_TEAM_KEYS:
-    st.session_state.team_names[team_key] = st.sidebar.text_input(
-        f"{team_key} 名称",
-        value=st.session_state.team_names.get(team_key, DEFAULT_TEAM_NAMES[team_key]),
-        key=f"team_name_input_{team_key}"
-    ).strip() or DEFAULT_TEAM_NAMES[team_key]
-
-team_options = {
-    team_key: get_team_name(team_key)
-    for team_key in DEFAULT_TEAM_KEYS
-}
+current_team_keys = get_team_keys()
+if "selected_team_key" not in st.session_state or st.session_state.selected_team_key not in current_team_keys:
+    st.session_state.selected_team_key = current_team_keys[0]
 
 selected_team_key = st.sidebar.selectbox(
     "切换队伍",
-    DEFAULT_TEAM_KEYS,
-    format_func=lambda x: team_options[x]
+    current_team_keys,
+    format_func=lambda x: get_team_name(x),
+    key="selected_team_key"
 )
 selected_team_name = get_team_name(selected_team_key)
+
+with st.sidebar.expander("✏️ 队伍名称设置", expanded=False):
+    new_team_count = st.number_input(
+        "队伍数量",
+        min_value=1,
+        max_value=30,
+        value=st.session_state.team_count,
+        step=1
+    )
+
+    old_team_count = st.session_state.team_count
+    if new_team_count != old_team_count:
+        st.session_state.team_count = int(new_team_count)
+
+        for i in range(1, st.session_state.team_count + 1):
+            team_key = make_team_key(i)
+            if team_key not in st.session_state.team_names:
+                st.session_state.team_names[team_key] = get_default_team_name(team_key)
+            if team_key not in st.session_state.team_roles:
+                st.session_state.team_roles[team_key] = get_default_roles(team_key)
+
+        valid_team_keys = get_team_keys()
+        if st.session_state.selected_team_key not in valid_team_keys:
+            st.session_state.selected_team_key = valid_team_keys[0]
+        st.rerun()
+
+    for team_key in get_team_keys():
+        st.session_state.team_names[team_key] = st.text_input(
+            f"{team_key} 名称",
+            value=st.session_state.team_names.get(team_key, get_default_team_name(team_key)),
+            key=f"team_name_input_{team_key}"
+        ).strip() or get_default_team_name(team_key)
 
 current_view = f"{selected_event_name}_{selected_team_key}"
 save_key = current_view
@@ -247,8 +299,8 @@ current_days = st.sidebar.number_input(
 )
 st.session_state[days_key] = current_days
 
-base_list = st.session_state.base_schedules[current_view]
 time_slots = [f"{i}:00-{i+1}:00" for i in range(24)]
+base_list = st.session_state.base_schedules[current_view]
 
 while len(base_list) < current_days:
     base_list.append(make_empty_schedule(team_roles, time_slots))
@@ -269,8 +321,6 @@ if current_view not in st.session_state.latest_schedules or not st.session_state
     st.session_state.latest_schedules[current_view] = [
         df.copy() for df in st.session_state.base_schedules[current_view]
     ]
-
-st.sidebar.header("☁️ 云端存档 (Google Sheets)")
 
 if st.sidebar.button("☁️ 云端读取当前队伍", use_container_width=True):
     if conn is None:
@@ -326,7 +376,7 @@ if st.sidebar.button("☁️ 云端保存当前队伍", use_container_width=True
             st.sidebar.error(f"云端保存失败：{e}")
 
 if st.sidebar.button("⚠️ 清空所有数据", type="primary", width="stretch"):
-    for key in ["base_schedules", "latest_schedules", "team_roles", "team_names"]:
+    for key in ["base_schedules", "latest_schedules", "team_roles", "team_names", "team_count"]:
         if key in st.session_state:
             del st.session_state[key]
     st.session_state.last_view = None
