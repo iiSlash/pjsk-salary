@@ -44,13 +44,15 @@ def init_team_config():
     if "team_names" not in st.session_state:
         st.session_state.team_names = {}
 
+    if "team_roles" not in st.session_state:
+        st.session_state.team_roles = {}
+
     for i in range(1, st.session_state.team_count + 1):
         team_key = make_team_key(i)
         if team_key not in st.session_state.team_names:
             st.session_state.team_names[team_key] = get_default_team_name(team_key)
-
-    if "team_roles" not in st.session_state:
-        st.session_state.team_roles = {}
+        if team_key not in st.session_state.team_roles:
+            st.session_state.team_roles[team_key] = get_default_roles(team_key)
 
 
 def get_team_keys():
@@ -61,7 +63,7 @@ def get_team_name(team_key):
     return st.session_state.team_names.get(team_key, get_default_team_name(team_key))
 
 
-def get_save_data():
+def get_full_save_data():
     save_data = {
         "team_count": st.session_state.get("team_count", 6),
         "team_roles": st.session_state.get("team_roles", {}),
@@ -78,7 +80,20 @@ def get_save_data():
     return save_data
 
 
-def apply_save_data(data):
+def get_basic_config_data():
+    basic_data = {
+        "team_count": st.session_state.get("team_count", 6),
+        "team_roles": st.session_state.get("team_roles", {}),
+        "team_names": st.session_state.get("team_names", {}),
+        "days": {}
+    }
+    for k, v in st.session_state.items():
+        if k.startswith("days_"):
+            basic_data["days"][k] = v
+    return basic_data
+
+
+def apply_basic_config_data(data):
     st.session_state.team_count = int(data.get("team_count", 6))
     st.session_state.team_names = data.get("team_names", {})
     st.session_state.team_roles = data.get("team_roles", {})
@@ -90,6 +105,13 @@ def apply_save_data(data):
         if team_key not in st.session_state.team_roles:
             st.session_state.team_roles[team_key] = get_default_roles(team_key)
 
+    for k, v in data.get("days", {}).items():
+        st.session_state[k] = v
+
+
+def apply_full_save_data(data):
+    apply_basic_config_data(data)
+
     loaded_schedules = {}
     for k, v in data.get("latest_schedules", {}).items():
         loaded_schedules[k] = [
@@ -97,9 +119,6 @@ def apply_save_data(data):
         ]
     st.session_state.latest_schedules = loaded_schedules
     st.session_state.last_view = None
-
-    for k, v in data.get("days", {}).items():
-        st.session_state[k] = v
 
 
 def ensure_sheet_columns(df):
@@ -133,12 +152,57 @@ def export_schedule_excel(schedule_list, time_slots, team_roles):
     return output.getvalue()
 
 
+def save_basic_config_to_cloud(conn):
+    try:
+        cloud_df = conn.read(worksheet="saves", ttl=0)
+        cloud_df = ensure_sheet_columns(cloud_df)
+
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        config_key = "__GLOBAL_CONFIG__"
+        data_json = json.dumps(get_basic_config_data(), ensure_ascii=False)
+
+        new_row = pd.DataFrame([{
+            "save_key": config_key,
+            "event_name": "__CONFIG__",
+            "team_key": "__CONFIG__",
+            "team_name": "基础设置",
+            "updated_at": now_str,
+            "data_json": data_json
+        }])
+
+        cloud_df = cloud_df[cloud_df["save_key"] != config_key]
+        cloud_df = pd.concat([cloud_df, new_row], ignore_index=True)
+        conn.update(worksheet="saves", data=cloud_df)
+        return True, "基础设置已保存到云端"
+    except Exception as e:
+        return False, f"基础设置云端保存失败：{e}"
+
+
+def load_basic_config_from_cloud(conn):
+    try:
+        cloud_df = conn.read(worksheet="saves", ttl=0)
+        cloud_df = ensure_sheet_columns(cloud_df)
+
+        matched = cloud_df[cloud_df["save_key"] == "__GLOBAL_CONFIG__"]
+        if matched.empty:
+            return False, "云端没有基础设置"
+
+        latest_row = matched.iloc[-1]
+        loaded_data = json.loads(latest_row["data_json"])
+        apply_basic_config_data(loaded_data)
+        return True, "基础设置已从云端恢复"
+    except Exception as e:
+        return False, f"基础设置云端读取失败：{e}"
+
+
 if "base_schedules" not in st.session_state:
     st.session_state.base_schedules = {}
 if "latest_schedules" not in st.session_state:
     st.session_state.latest_schedules = {}
 if "last_view" not in st.session_state:
     st.session_state.last_view = None
+if "cloud_config_loaded" not in st.session_state:
+    st.session_state.cloud_config_loaded = False
 
 init_team_config()
 
@@ -196,6 +260,11 @@ try:
 except Exception:
     conn = None
 
+# 首次启动时自动从云端恢复基础设置，解决刷新后队伍名称和数量丢失问题
+if conn is not None and not st.session_state.cloud_config_loaded:
+    ok, msg = load_basic_config_from_cloud(conn)
+    st.session_state.cloud_config_loaded = True
+
 current_dt = datetime.datetime.now()
 default_event_idx = 0
 for i, row in events_df.iterrows():
@@ -203,8 +272,11 @@ for i, row in events_df.iterrows():
         default_event_idx = int(i)
         break
 
+# ===== 侧边栏最上方先放云端存档按钮 =====
 st.sidebar.header("☁️ 云端存档 (Google Sheets)")
+cloud_top_container = st.sidebar.container()
 
+# ===== 再放活动与队伍 =====
 st.sidebar.header("🗓️ 活动与队伍")
 selected_display_name = st.sidebar.selectbox(
     "选择排期活动",
@@ -234,11 +306,12 @@ with st.sidebar.expander("✏️ 队伍名称设置", expanded=False):
         min_value=1,
         max_value=30,
         value=st.session_state.team_count,
-        step=1
+        step=1,
+        key="team_count_input"
     )
 
     old_team_count = st.session_state.team_count
-    if new_team_count != old_team_count:
+    if int(new_team_count) != int(old_team_count):
         st.session_state.team_count = int(new_team_count)
 
         for i in range(1, st.session_state.team_count + 1):
@@ -248,17 +321,36 @@ with st.sidebar.expander("✏️ 队伍名称设置", expanded=False):
             if team_key not in st.session_state.team_roles:
                 st.session_state.team_roles[team_key] = get_default_roles(team_key)
 
+        if conn is not None:
+            save_basic_config_to_cloud(conn)
+
         valid_team_keys = get_team_keys()
         if st.session_state.selected_team_key not in valid_team_keys:
             st.session_state.selected_team_key = valid_team_keys[0]
         st.rerun()
 
     for team_key in get_team_keys():
-        st.session_state.team_names[team_key] = st.text_input(
+        input_key = f"team_name_input_{team_key}"
+        default_value = st.session_state.team_names.get(team_key, get_default_team_name(team_key))
+
+        team_name_value = st.text_input(
             f"{team_key} 名称",
-            value=st.session_state.team_names.get(team_key, get_default_team_name(team_key)),
-            key=f"team_name_input_{team_key}"
-        ).strip() or get_default_team_name(team_key)
+            value=default_value,
+            key=input_key
+        ).strip()
+
+        st.session_state.team_names[team_key] = team_name_value or get_default_team_name(team_key)
+
+    if st.button("💾 保存队伍基础设置到云端", use_container_width=True):
+        if conn is None:
+            st.warning("云端存储未配置！请检查 Secrets。")
+        else:
+            ok, msg = save_basic_config_to_cloud(conn)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
 
 current_view = f"{selected_event_name}_{selected_team_key}"
 save_key = current_view
@@ -322,61 +414,68 @@ if current_view not in st.session_state.latest_schedules or not st.session_state
         df.copy() for df in st.session_state.base_schedules[current_view]
     ]
 
-if st.sidebar.button("☁️ 云端读取当前队伍", use_container_width=True):
-    if conn is None:
-        st.sidebar.error("云端存储未配置！请检查 Secrets。")
-    else:
-        try:
-            cloud_df = conn.read(worksheet="saves", ttl=0)
-            cloud_df = ensure_sheet_columns(cloud_df)
-            matched = cloud_df[cloud_df["save_key"] == save_key]
-            if not matched.empty:
-                latest_row = matched.iloc[-1]
-                loaded_data = json.loads(latest_row["data_json"])
-                apply_save_data(loaded_data)
+# ===== 真正把按钮也放到最上面的 container 里 =====
+with cloud_top_container:
+    if st.button("☁️ 云端读取当前队伍", use_container_width=True):
+        if conn is None:
+            st.sidebar.error("云端存储未配置！请检查 Secrets。")
+        else:
+            try:
+                cloud_df = conn.read(worksheet="saves", ttl=0)
+                cloud_df = ensure_sheet_columns(cloud_df)
+                matched = cloud_df[cloud_df["save_key"] == save_key]
+                if not matched.empty:
+                    latest_row = matched.iloc[-1]
+                    loaded_data = json.loads(latest_row["data_json"])
+                    apply_full_save_data(loaded_data)
 
-                for i in range(30):
-                    ekey = f"editor_{current_view}_day_{i}"
-                    if ekey in st.session_state:
-                        del st.session_state[ekey]
+                    for i in range(30):
+                        ekey = f"editor_{current_view}_day_{i}"
+                        if ekey in st.session_state:
+                            del st.session_state[ekey]
 
-                st.sidebar.success("云端读档成功，页面即将刷新")
-                st.rerun()
-            else:
-                st.sidebar.warning("云端没有找到该活动和队伍的存档")
-        except Exception as e:
-            st.sidebar.error(f"云端读档失败：{e}")
+                    st.sidebar.success("云端读档成功，页面即将刷新")
+                    st.rerun()
+                else:
+                    st.sidebar.warning("云端没有找到该活动和队伍的存档")
+            except Exception as e:
+                st.sidebar.error(f"云端读档失败：{e}")
 
-if st.sidebar.button("☁️ 云端保存当前队伍", use_container_width=True):
-    if conn is None:
-        st.sidebar.error("云端存储未配置！请检查 Secrets。")
-    else:
-        try:
-            cloud_df = conn.read(worksheet="saves", ttl=0)
-            cloud_df = ensure_sheet_columns(cloud_df)
+    if st.button("☁️ 云端保存当前队伍", use_container_width=True):
+        if conn is None:
+            st.sidebar.error("云端存储未配置！请检查 Secrets。")
+        else:
+            try:
+                save_basic_config_to_cloud(conn)
 
-            current_data_json = json.dumps(get_save_data(), ensure_ascii=False)
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cloud_df = conn.read(worksheet="saves", ttl=0)
+                cloud_df = ensure_sheet_columns(cloud_df)
 
-            new_row = pd.DataFrame([{
-                "save_key": save_key,
-                "event_name": selected_event_name,
-                "team_key": selected_team_key,
-                "team_name": selected_team_name,
-                "updated_at": now_str,
-                "data_json": current_data_json
-            }])
+                current_data_json = json.dumps(get_full_save_data(), ensure_ascii=False)
+                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            cloud_df = cloud_df[cloud_df["save_key"] != save_key]
-            cloud_df = pd.concat([cloud_df, new_row], ignore_index=True)
+                new_row = pd.DataFrame([{
+                    "save_key": save_key,
+                    "event_name": selected_event_name,
+                    "team_key": selected_team_key,
+                    "team_name": selected_team_name,
+                    "updated_at": now_str,
+                    "data_json": current_data_json
+                }])
 
-            conn.update(worksheet="saves", data=cloud_df)
-            st.sidebar.success("云端保存成功")
-        except Exception as e:
-            st.sidebar.error(f"云端保存失败：{e}")
+                cloud_df = cloud_df[cloud_df["save_key"] != save_key]
+                cloud_df = pd.concat([cloud_df, new_row], ignore_index=True)
+
+                conn.update(worksheet="saves", data=cloud_df)
+                st.sidebar.success("云端保存成功（含基础设置）")
+            except Exception as e:
+                st.sidebar.error(f"云端保存失败：{e}")
 
 if st.sidebar.button("⚠️ 清空所有数据", type="primary", width="stretch"):
-    for key in ["base_schedules", "latest_schedules", "team_roles", "team_names", "team_count"]:
+    for key in [
+        "base_schedules", "latest_schedules", "team_roles", "team_names",
+        "team_count", "cloud_config_loaded", "selected_team_key"
+    ]:
         if key in st.session_state:
             del st.session_state[key]
     st.session_state.last_view = None
