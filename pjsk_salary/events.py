@@ -89,6 +89,46 @@ def find_current_event(
     return max(candidates, key=lambda event: event.start, default=None)
 
 
+def find_best_event_for_schedule(
+    events: Iterable[EventPeriod],
+    schedule_start: dt.date,
+    schedule_end: dt.date,
+    fallback: EventPeriod | None = None,
+) -> EventPeriod | None:
+    """Prefer the event containing the schedule, then the greatest date overlap."""
+
+    event_list = list(events)
+    if not event_list:
+        return fallback
+
+    def score(event: EventPeriod) -> tuple[int, int, int, float]:
+        event_start = event.start.date()
+        event_end = event.end.date()
+        overlap_start = max(schedule_start, event_start)
+        overlap_end = min(schedule_end, event_end)
+        overlap_days = max(0, (overlap_end - overlap_start).days + 1)
+        contains_schedule = int(
+            event_start <= schedule_start and schedule_end <= event_end
+        )
+        exact_boundaries = int(
+            event_start == schedule_start and event_end == schedule_end
+        )
+        boundary_distance = abs((event_start - schedule_start).days) + abs(
+            (event_end - schedule_end).days
+        )
+        return (
+            contains_schedule,
+            overlap_days,
+            exact_boundaries,
+            -float(boundary_distance),
+        )
+
+    best = max(event_list, key=score)
+    if score(best)[1] == 0 and fallback is not None:
+        return fallback
+    return best
+
+
 def compare_schedule_dates(
     schedule_start: dt.date,
     schedule_end: dt.date,

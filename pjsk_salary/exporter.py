@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import io
+import datetime as dt
 import re
 from typing import Mapping
 
 import pandas as pd
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 from .salary import SalaryResult
+from .schedule import START_MINUTES_COLUMN, TIME_COLUMN
 
 
 HEADER_FILL = PatternFill("solid", fgColor="35665C")
@@ -17,6 +20,7 @@ TOTAL_BORDER = Border(top=Side(style="thin", color="35665C"))
 DATE_FILL = PatternFill("solid", fgColor="EAF2F8")
 ROLE_FILL = PatternFill("solid", fgColor="F7E6F5")
 ASSIGNMENT_FILL = PatternFill("solid", fgColor="EAF5EE")
+NIGHT_FILL = PatternFill("solid", fgColor="F1F3F5")
 DATE_TEXT_RE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$|^\d{1,2}月\d{1,2}日$")
 TIME_TEXT_RE = re.compile(r"^\d{1,2}:\d{2}\s*[-~～—–至]\s*\d{1,2}:\d{2}$")
 
@@ -24,7 +28,12 @@ TIME_TEXT_RE = re.compile(r"^\d{1,2}:\d{2}\s*[-~～—–至]\s*\d{1,2}:\d{2}$")
 def export_salary_excel(
     result: SalaryResult,
     rates: pd.DataFrame,
-    schedule_sheets: Mapping[str, pd.DataFrame] | None = None,
+    schedule_grids: Mapping[
+        str, Mapping[dt.date, pd.DataFrame] | pd.DataFrame
+    ]
+    | None = None,
+    day_start_hour: int = 8,
+    night_start_hour: int = 20,
 ) -> bytes:
     output = io.BytesIO()
     summary = _summary_with_total(result)
@@ -37,19 +46,33 @@ def export_salary_excel(
         rate_export.to_excel(writer, sheet_name="工价设置", index=False)
 
         used_sheet_names = set(writer.sheets)
-        for team, frame in (schedule_sheets or {}).items():
+        for team, date_grids in (schedule_grids or {}).items():
             sheet_name = _schedule_sheet_name(str(team), used_sheet_names)
-            _safe_frame(frame).to_excel(
-                writer,
-                sheet_name=sheet_name,
-                index=False,
-                header=False,
-            )
+            if isinstance(date_grids, pd.DataFrame):
+                _safe_frame(date_grids).to_excel(
+                    writer,
+                    sheet_name=sheet_name,
+                    index=False,
+                    header=False,
+                )
+            else:
+                worksheet = writer.book.create_sheet(sheet_name)
+                writer.sheets[sheet_name] = worksheet
+                _write_daily_schedule(
+                    worksheet,
+                    date_grids,
+                    day_start_hour=day_start_hour,
+                    night_start_hour=night_start_hour,
+                )
             used_sheet_names.add(sheet_name)
 
         for sheet_name, worksheet in writer.sheets.items():
             if sheet_name.startswith("排班-"):
-                _format_schedule_sheet(worksheet)
+                if not any(
+                    isinstance(value, Mapping)
+                    for value in (schedule_grids or {}).values()
+                ):
+                    _format_schedule_sheet(worksheet)
                 continue
 
             worksheet.freeze_panes = "A2"
@@ -91,6 +114,95 @@ def export_salary_excel(
                                 date_cell.number_format = "yyyy-mm-dd"
 
     return output.getvalue()
+
+
+def _write_daily_schedule(
+    worksheet,
+    date_grids: Mapping[dt.date, pd.DataFrame],
+    *,
+    day_start_hour: int,
+    night_start_hour: int,
+) -> None:
+    worksheet.freeze_panes = "B3"
+    worksheet.sheet_view.showGridLines = False
+    current_row = 1
+    maximum_columns = 1
+
+    for schedule_date, frame in sorted(date_grids.items()):
+        role_columns = [
+            str(column)
+            for column in frame.columns
+            if column not in {TIME_COLUMN, START_MINUTES_COLUMN}
+        ]
+        headers = [TIME_COLUMN, *role_columns]
+        maximum_columns = max(maximum_columns, len(headers))
+
+        if len(headers) > 1:
+            worksheet.merge_cells(
+                start_row=current_row,
+                start_column=1,
+                end_row=current_row,
+                end_column=len(headers),
+            )
+        date_cell = worksheet.cell(current_row, 1, schedule_date)
+        date_cell.number_format = "yyyy-mm-dd"
+        date_cell.fill = DATE_FILL
+        date_cell.font = Font(bold=True, color="1F2937")
+        date_cell.alignment = Alignment(horizontal="left", vertical="center")
+        worksheet.row_dimensions[current_row].height = 24
+        current_row += 1
+
+        for column_index, header in enumerate(headers, start=1):
+            cell = worksheet.cell(current_row, column_index, _safe_text(header))
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        worksheet.row_dimensions[current_row].height = 22
+        current_row += 1
+
+        for _, grid_row in frame.sort_values(START_MINUTES_COLUMN, kind="stable").iterrows():
+            start_minutes = int(grid_row[START_MINUTES_COLUMN])
+            is_night = _is_night_minutes(
+                start_minutes,
+                day_start_hour=day_start_hour,
+                night_start_hour=night_start_hour,
+            )
+            values = [grid_row[TIME_COLUMN], *[grid_row[role] for role in role_columns]]
+            for column_index, value in enumerate(values, start=1):
+                cell = worksheet.cell(current_row, column_index, _safe_text(value))
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                if is_night:
+                    cell.fill = NIGHT_FILL
+            worksheet.row_dimensions[current_row].height = 20
+            current_row += 1
+        current_row += 1
+
+    worksheet.column_dimensions["A"].width = 16
+    for column_index in range(2, maximum_columns + 1):
+        column_letter = get_column_letter(column_index)
+        max_length = 10
+        for row in worksheet.iter_rows(
+            min_col=column_index,
+            max_col=column_index,
+            max_row=worksheet.max_row,
+        ):
+            cell = row[0]
+            if cell.value is not None:
+                max_length = max(max_length, len(str(cell.value)) + 2)
+        worksheet.column_dimensions[column_letter].width = min(max_length, 20)
+
+
+def _is_night_minutes(
+    minutes: int,
+    *,
+    day_start_hour: int,
+    night_start_hour: int,
+) -> bool:
+    day_start = day_start_hour * 60
+    night_start = night_start_hour * 60
+    if day_start < night_start:
+        return not day_start <= minutes < night_start
+    return night_start <= minutes < day_start
 
 
 def export_summary_csv(result: SalaryResult) -> bytes:

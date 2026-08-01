@@ -20,4 +20,5 @@ pjsk_manual_save.json
 
 data/*.json
 backup/
+outputs/
 *.log

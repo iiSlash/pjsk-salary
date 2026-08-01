@@ -6,6 +6,7 @@ from openpyxl import load_workbook
 from pjsk_salary.exporter import export_salary_excel
 from pjsk_salary.parser import parse_schedule_workbook, read_schedule_workbook
 from pjsk_salary.salary import build_default_rates, calculate_salary
+from pjsk_salary.schedule import build_daily_grids
 from tests.test_parser import make_schedule_workbook
 
 
@@ -14,16 +15,16 @@ class ExporterTests(unittest.TestCase):
         parsed = parse_schedule_workbook(make_schedule_workbook())
         rates = build_default_rates(parsed.records)
         result = calculate_salary(parsed.records, rates)
+        grids, _ = build_daily_grids(parsed.records, parsed.blocks)
 
         workbook = load_workbook(
             io.BytesIO(
                 export_salary_excel(
                     result,
                     rates,
-                    read_schedule_workbook(make_schedule_workbook()),
+                    grids,
                 )
             ),
-            read_only=True,
             data_only=True,
         )
 
@@ -40,7 +41,21 @@ class ExporterTests(unittest.TestCase):
             summary.cell(total_row, headers.index("应发工资") + 1).value,
             result.total_salary,
         )
-        self.assertEqual(workbook["排班-类五"]["B3"].value, "九九")
+        schedule = workbook["排班-类五"]
+        headers = [cell.value for cell in schedule[2]]
+        role_column = headers.index("跑1") + 1
+        slot_row = next(
+            row
+            for row in range(3, schedule.max_row + 1)
+            if schedule.cell(row, 1).value == "15:00-15:30"
+        )
+        self.assertEqual(schedule.cell(slot_row, role_column).value, "九九")
+        midnight_row = next(
+            row
+            for row in range(3, schedule.max_row + 1)
+            if schedule.cell(row, 1).value == "00:00-00:30"
+        )
+        self.assertEqual(schedule.cell(midnight_row, 1).fill.fgColor.rgb, "00F1F3F5")
 
     def test_escapes_spreadsheet_formulas_in_names_and_headers(self):
         parsed = parse_schedule_workbook(make_schedule_workbook())

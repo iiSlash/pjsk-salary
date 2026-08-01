@@ -7,23 +7,23 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from st_aggrid import AgGrid, DataReturnMode, GridUpdateMode, JsCode
 
 from pjsk_salary.events import (
     EventPeriod,
     compare_schedule_dates,
     fetch_pjsk_cn_events,
+    find_best_event_for_schedule,
     find_current_event,
 )
 from pjsk_salary.exporter import export_salary_excel, export_summary_csv
-from pjsk_salary.parser import (
-    ScheduleParseError,
-    parse_schedule_sheets,
-    read_schedule_workbook,
-)
-from pjsk_salary.salary import (
-    SalaryValidationError,
-    build_default_rates,
-    calculate_salary,
+from pjsk_salary.parser import ScheduleParseError, parse_schedule_sheets, read_schedule_workbook
+from pjsk_salary.salary import SalaryValidationError, build_default_rates, calculate_salary
+from pjsk_salary.schedule import (
+    START_MINUTES_COLUMN,
+    TIME_COLUMN,
+    build_daily_grids,
+    daily_grids_to_records,
 )
 
 
@@ -36,9 +36,8 @@ def load_workbook_sheets(file_bytes: bytes) -> dict[str, pd.DataFrame]:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_current_event() -> tuple[EventPeriod | None, str | None]:
-    events, error = fetch_pjsk_cn_events()
-    return find_current_event(events), error
+def load_events() -> tuple[list[EventPeriod], str | None]:
+    return fetch_pjsk_cn_events()
 
 
 def safe_filename(value: str) -> str:
@@ -52,40 +51,14 @@ def display_date_range(records: pd.DataFrame) -> str:
     return first_date if first_date == last_date else f"{first_date} 至 {last_date}"
 
 
-def excel_column_name(column_index: int) -> str:
-    column_number = column_index + 1
-    letters = ""
-    while column_number:
-        column_number, remainder = divmod(column_number - 1, 26)
-        letters = chr(65 + remainder) + letters
-    return letters
+def display_schedule_date(value: dt.date) -> str:
+    weekdays = "一二三四五六日"
+    return f"{value:%Y-%m-%d}（周{weekdays[value.weekday()]}）"
 
 
-def editor_cell_value(value: object) -> str:
-    if value is None:
-        return ""
-    try:
-        if bool(pd.isna(value)):
-            return ""
-    except (TypeError, ValueError):
-        pass
-    if isinstance(value, (pd.Timestamp, dt.datetime, dt.date)):
-        return pd.Timestamp(value).strftime("%Y-%m-%d")
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    return str(value)
-
-
-def make_editable_sheets(
-    sheets: dict[str, pd.DataFrame],
-) -> dict[str, pd.DataFrame]:
-    editable: dict[str, pd.DataFrame] = {}
-    for sheet_name, frame in sheets.items():
-        editor = frame.apply(lambda column: column.map(editor_cell_value))
-        editor.columns = [excel_column_name(index) for index in range(editor.shape[1])]
-        editor.index = pd.RangeIndex(1, len(editor) + 1, name="行")
-        editable[sheet_name] = editor
-    return editable
+def display_event(event: EventPeriod, current: EventPeriod | None) -> str:
+    current_marker = "【当前】" if event == current else ""
+    return f"{current_marker}{event.name}｜{event.date_label}"
 
 
 def reconcile_rates(
@@ -107,16 +80,103 @@ def reconcile_rates(
     return merged[["班组", "岗位", "白班价", "夜班价"]]
 
 
-st.title("💰 PJSK 工资计算器")
-st.caption("核对排班、微调人员、设置工价，然后直接生成可发放的工资表。数据只保存在当前会话中。")
+def edit_daily_grid(
+    frame: pd.DataFrame,
+    *,
+    key: str,
+    day_start_hour: int,
+    night_start_hour: int,
+) -> pd.DataFrame:
+    role_columns = [
+        str(column)
+        for column in frame.columns
+        if column not in {TIME_COLUMN, START_MINUTES_COLUMN}
+    ]
+    column_defs = [
+        {
+            "field": TIME_COLUMN,
+            "headerName": "时间",
+            "editable": False,
+            "pinned": "left",
+            "lockPosition": "left",
+            "width": 135,
+            "minWidth": 135,
+            "maxWidth": 135,
+            "cellStyle": {"fontWeight": "600"},
+        }
+    ]
+    column_defs.extend(
+        {
+            "field": role,
+            "headerName": role,
+            "editable": True,
+            "minWidth": 115,
+            "flex": 1,
+        }
+        for role in role_columns
+    )
+    column_defs.append({"field": START_MINUTES_COLUMN, "hide": True})
 
-with st.spinner("正在获取简中服当前活动……"):
-    current_event, event_error = load_current_event()
+    day_start_minutes = day_start_hour * 60
+    night_start_minutes = night_start_hour * 60
+    row_style = JsCode(
+        f"""
+        function(params) {{
+            const minute = Number(params.data.{START_MINUTES_COLUMN});
+            const dayStart = {day_start_minutes};
+            const nightStart = {night_start_minutes};
+            const isDay = dayStart < nightStart
+                ? minute >= dayStart && minute < nightStart
+                : minute >= dayStart || minute < nightStart;
+            return isDay ? null : {{ backgroundColor: '#f1f3f5' }};
+        }}
+        """
+    )
+    grid_options = {
+        "columnDefs": column_defs,
+        "defaultColDef": {
+            "resizable": True,
+            "sortable": False,
+            "filter": False,
+            "suppressMovable": True,
+        },
+        "getRowStyle": row_style,
+        "singleClickEdit": True,
+        "stopEditingWhenCellsLoseFocus": True,
+        "suppressRowClickSelection": True,
+        "rowHeight": 29,
+        "headerHeight": 38,
+    }
+    response = AgGrid(
+        frame,
+        gridOptions=grid_options,
+        data_return_mode=DataReturnMode.AS_INPUT,
+        update_mode=GridUpdateMode.VALUE_CHANGED,
+        allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=False,
+        height=min(790, 44 + 29 * len(frame)),
+        theme="streamlit",
+        key=key,
+    )
+    edited = pd.DataFrame(response["data"])
+    edited = edited.reindex(columns=frame.columns)
+    edited[START_MINUTES_COLUMN] = pd.to_numeric(
+        edited[START_MINUTES_COLUMN], errors="coerce"
+    ).fillna(frame[START_MINUTES_COLUMN]).astype(int)
+    return edited
+
+
+st.title("💰 PJSK 工资计算器")
+st.caption("选择活动、核对每日排班、设置工价，然后直接生成可发放的工资表。数据只保存在当前会话中。")
+
+with st.spinner("正在获取简中服活动列表……"):
+    events, event_error = load_events()
+current_event = find_current_event(events)
 
 if current_event is not None:
     st.info(f"🎵 当前活动：{current_event.name}　｜　{current_event.date_label}")
 elif event_error:
-    st.warning("暂时无法获取简中服当前活动。排班和工资计算仍可离线使用。")
+    st.warning("暂时无法获取简中服活动列表。排班和工资计算仍可离线使用。")
 else:
     st.info("当前没有识别到正在进行的简中服活动。")
 
@@ -144,73 +204,24 @@ file_fingerprint = hashlib.sha256(file_bytes).hexdigest()[:16]
 
 try:
     original_sheets = load_workbook_sheets(file_bytes)
+    original_parsed = parse_schedule_sheets(original_sheets)
 except ScheduleParseError as exc:
     st.error(str(exc))
     st.stop()
 
-st.subheader("1. 核对并微调完整排班")
-st.caption("下面保留上传表格的完整横向布局。双击单元格即可改人名、岗位或时间，工资会自动重新计算。")
-
-schedule_state_key = f"schedule_sheets_{file_fingerprint}"
-schedule_editor_keys = {
-    sheet_name: f"schedule_editor_{file_fingerprint}_{index}"
-    for index, sheet_name in enumerate(original_sheets)
-}
-if schedule_state_key not in st.session_state:
-    st.session_state[schedule_state_key] = make_editable_sheets(original_sheets)
-
-if st.button("恢复上传时的排班", use_container_width=False):
-    st.session_state[schedule_state_key] = make_editable_sheets(original_sheets)
-    for editor_key in schedule_editor_keys.values():
-        st.session_state.pop(editor_key, None)
-    st.rerun()
-
-schedule_sheets: dict[str, pd.DataFrame] = {}
-sheet_names = list(original_sheets)
-sheet_tabs = st.tabs(sheet_names) if len(sheet_names) > 1 else [st.container()]
-for sheet_name, sheet_tab in zip(sheet_names, sheet_tabs):
-    with sheet_tab:
-        if len(sheet_names) == 1:
-            st.caption(f"工作表：{sheet_name}")
-        source_frame = st.session_state[schedule_state_key][sheet_name]
-        editor_height = min(700, max(280, 35 * (len(source_frame) + 1)))
-        schedule_sheets[sheet_name] = st.data_editor(
-            source_frame,
-            key=schedule_editor_keys[sheet_name],
-            height=editor_height,
-            use_container_width=True,
-            num_rows="fixed",
-        )
-st.session_state[schedule_state_key] = schedule_sheets
-
-try:
-    parsed = parse_schedule_sheets(schedule_sheets)
-except ScheduleParseError as exc:
-    st.error(f"当前排班无法计算：{exc}")
-    st.stop()
-
-records = parsed.records
-blocks = parsed.blocks
-all_teams = parsed.teams
-
-st.success(
-    f"已识别 {len(blocks)} 个日期区块、{records['person'].nunique()} 人、"
-    f"{len(records)} 个已填写岗位单元格。"
+initial_grids, time_step_minutes = build_daily_grids(
+    original_parsed.records, original_parsed.blocks
 )
-for warning in parsed.warnings:
-    st.warning(warning)
+schedule_state_key = f"daily_schedule_{file_fingerprint}"
+schedule_revision_key = f"daily_schedule_revision_{file_fingerprint}"
+if schedule_state_key not in st.session_state:
+    st.session_state[schedule_state_key] = initial_grids
+    st.session_state[schedule_revision_key] = 0
 
-schedule_start = records["date"].min().date()
-schedule_end = records["date"].max().date()
-event_match: str | None = None
-if current_event is not None:
-    event_match = compare_schedule_dates(schedule_start, schedule_end, current_event)
-    if event_match == "match":
-        st.success("活动校验通过：排班日期完整落在当前活动周期内。")
-    elif event_match == "partial":
-        st.warning("活动校验：排班只有部分日期与当前活动重合，请检查首尾日期。")
-    else:
-        st.warning("活动校验：排班日期不属于当前活动，请确认是否上传了上一期或下一期排班。")
+daily_grids: dict[str, dict[dt.date, pd.DataFrame]] = st.session_state[
+    schedule_state_key
+]
+all_teams = list(daily_grids)
 
 with st.sidebar:
     st.header("计算范围")
@@ -218,7 +229,7 @@ with st.sidebar:
         "班组（工作表）",
         options=all_teams,
         default=all_teams,
-        help="一个 Excel 工作表对应一个班组。",
+        help="一个 Excel 工作表对应一个班组。未选中的班组仍可查看，但不会计入工资。",
     )
     st.header("白班 / 夜班")
     day_start_hour = st.selectbox(
@@ -233,37 +244,117 @@ with st.sidebar:
         index=20,
         format_func=lambda hour: f"{hour:02d}:00",
     )
-    st.caption("跨越班次边界的时间段会按白班和夜班分别计价。")
+    st.caption("排班表中的浅灰色行是夜班；跨越边界的时段会分别计价。")
     st.divider()
     st.caption("排班和工资不会上传或持久化保存，关闭会话后即可丢弃。")
 
 if not selected_teams:
     st.warning("请至少选择一个班组。")
     st.stop()
+if day_start_hour == night_start_hour:
+    st.error("白班开始时间不能和夜班开始时间相同。")
+    st.stop()
+
+original_start = original_parsed.records["date"].min().date()
+original_end = original_parsed.records["date"].max().date()
+
+st.subheader("1. 选择结算活动")
+selected_event: EventPeriod | None = None
+if events:
+    suggested_event = find_best_event_for_schedule(
+        events,
+        original_start,
+        original_end,
+        fallback=current_event,
+    )
+    suggested_index = events.index(suggested_event) if suggested_event in events else 0
+    selected_event = st.selectbox(
+        "活动",
+        options=events,
+        index=suggested_index,
+        format_func=lambda event: display_event(event, current_event),
+        key=f"event_selector_{file_fingerprint}",
+        help="会优先选择与排班日期最匹配的活动，也可以手动改成上一期或其他活动。",
+    )
+    st.caption("当前活动仍会标注出来；活动选择只用于日期校验和导出命名，不改变工资算法。")
+else:
+    st.warning("活动列表暂不可用，已跳过活动选择与日期校验。")
+
+st.subheader("2. 核对并微调每日排班")
+st.caption(
+    "每次显示一个班组的一天。时间列固定在左侧且不能修改；双击或单击人员单元格即可改名，工资会自动重算。"
+)
+
+control_columns = st.columns([1, 1, 2])
+with control_columns[0]:
+    viewed_team = st.selectbox(
+        "查看班组",
+        options=all_teams,
+        key=f"view_team_{file_fingerprint}",
+    )
+with control_columns[1]:
+    available_dates = list(daily_grids[viewed_team])
+    viewed_date = st.selectbox(
+        "查看日期",
+        options=available_dates,
+        format_func=display_schedule_date,
+        key=f"view_date_{file_fingerprint}_{viewed_team}",
+    )
+with control_columns[2]:
+    st.write("")
+    st.write("")
+    if st.button("恢复上传时的全部排班", use_container_width=False):
+        restored_grids, _ = build_daily_grids(
+            original_parsed.records, original_parsed.blocks
+        )
+        st.session_state[schedule_state_key] = restored_grids
+        st.session_state[schedule_revision_key] += 1
+        st.rerun()
+
+revision = st.session_state[schedule_revision_key]
+grid_key = (
+    f"daily_grid_{file_fingerprint}_{viewed_team}_{viewed_date.isoformat()}_"
+    f"{revision}_{day_start_hour}_{night_start_hour}"
+)
+edited_grid = edit_daily_grid(
+    daily_grids[viewed_team][viewed_date],
+    key=grid_key,
+    day_start_hour=day_start_hour,
+    night_start_hour=night_start_hour,
+)
+daily_grids[viewed_team][viewed_date] = edited_grid
+st.session_state[schedule_state_key] = daily_grids
+
+records = daily_grids_to_records(daily_grids, time_step_minutes)
+if records.empty:
+    st.error("当前排班没有任何人员，无法计算工资。请填写至少一个人员单元格。")
+    st.stop()
+
+st.success(
+    f"已载入 {sum(len(date_grids) for date_grids in daily_grids.values())} 个单日排班、"
+    f"{records['person'].nunique()} 人、{len(records)} 个已填写岗位单元格。"
+)
+
+schedule_start = records["date"].min().date()
+schedule_end = records["date"].max().date()
+event_match: str | None = None
+if selected_event is not None:
+    event_match = compare_schedule_dates(schedule_start, schedule_end, selected_event)
+    if event_match == "match":
+        st.success(f"活动校验通过：排班日期完整落在「{selected_event.name}」周期内。")
+    elif event_match == "partial":
+        st.warning(f"活动校验：排班只有部分日期与「{selected_event.name}」重合，请检查首尾日期。")
+    else:
+        st.warning(f"活动校验：排班日期不属于「{selected_event.name}」，请切换活动或检查排班日期。")
 
 filtered_records = records[records["team"].isin(selected_teams)].copy()
-filtered_blocks = blocks[blocks["team"].isin(selected_teams)].copy()
-
 metric_columns = st.columns(4)
 metric_columns[0].metric("日期范围", display_date_range(filtered_records))
 metric_columns[1].metric("结算人数", int(filtered_records["person"].nunique()))
 metric_columns[2].metric("排班工时", f"{filtered_records['duration_hours'].sum():,.1f}")
 metric_columns[3].metric("班组", len(selected_teams))
 
-with st.expander("查看识别到的日期区块", expanded=False):
-    block_display = filtered_blocks.rename(
-        columns={
-            "team": "班组",
-            "date": "日期",
-            "roles": "岗位",
-            "time_slots": "时间段数量",
-            "assignments": "已填写单元格",
-            "source_cell": "区块起点",
-        }
-    )
-    st.dataframe(block_display, hide_index=True, use_container_width=True)
-
-st.subheader("2. 设置工价")
+st.subheader("3. 设置工价")
 st.caption("默认：跑类和 s6 为白班 30 / 夜班 35；推类为白班 20 / 夜班 25。仍可逐项修改。")
 
 default_rates = build_default_rates(records)
@@ -303,7 +394,7 @@ edited_rates = st.data_editor(
 st.session_state[rates_state_key] = edited_rates
 selected_rates = edited_rates[edited_rates["班组"].isin(selected_teams)].copy()
 
-st.subheader("3. 发薪结果")
+st.subheader("4. 发薪结果")
 try:
     result = calculate_salary(
         filtered_records,
@@ -352,19 +443,21 @@ with detail_tab:
         },
     )
 
-st.subheader("4. 导出结算结果")
-default_export_name = (
-    current_event.name
-    if current_event is not None and event_match == "match"
-    else Path(uploaded_file.name).stem
-)
+st.subheader("5. 导出结算结果")
+default_export_name = selected_event.name if selected_event is not None else Path(uploaded_file.name).stem
 event_name = st.text_input("导出文件名", value=default_export_name).strip()
 download_name = safe_filename(event_name)
-selected_schedule_sheets = {
-    team: schedule_sheets[team] for team in selected_teams if team in schedule_sheets
+selected_schedule_grids = {
+    team: daily_grids[team] for team in selected_teams if team in daily_grids
 }
 
-excel_bytes = export_salary_excel(result, selected_rates, selected_schedule_sheets)
+excel_bytes = export_salary_excel(
+    result,
+    selected_rates,
+    schedule_grids=selected_schedule_grids,
+    day_start_hour=day_start_hour,
+    night_start_hour=night_start_hour,
+)
 csv_bytes = export_summary_csv(result)
 excel_column, csv_column = st.columns(2)
 with excel_column:
@@ -385,4 +478,4 @@ with csv_column:
         use_container_width=True,
     )
 
-st.caption("Excel 包含精简发薪汇总、按日结算明细、工价设置，以及微调后的完整排班工作表。")
+st.caption("Excel 包含精简发薪汇总、按日结算明细、工价设置，以及按日期整理的完整排班；夜班行同样使用浅灰色。")
