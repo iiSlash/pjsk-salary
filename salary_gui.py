@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -23,7 +24,9 @@ from pjsk_salary.schedule import (
     START_MINUTES_COLUMN,
     TIME_COLUMN,
     build_daily_grids,
+    build_horizontal_grid,
     daily_grids_to_records,
+    horizontal_grid_to_daily_grids,
 )
 
 
@@ -80,41 +83,99 @@ def reconcile_rates(
     return merged[["班组", "岗位", "白班价", "夜班价"]]
 
 
-def edit_daily_grid(
-    frame: pd.DataFrame,
+def edit_horizontal_schedule(
+    date_grids: dict[dt.date, pd.DataFrame],
     *,
     key: str,
     day_start_hour: int,
     night_start_hour: int,
-) -> pd.DataFrame:
-    role_columns = [
-        str(column)
-        for column in frame.columns
-        if column not in {TIME_COLUMN, START_MINUTES_COLUMN}
+) -> dict[dt.date, pd.DataFrame]:
+    frame, date_columns = build_horizontal_grid(date_grids)
+    date_options = [
+        {
+            "field": next(iter(fields)),
+            "label": f"{schedule_date:%m-%d} 周{'一二三四五六日'[schedule_date.weekday()]}",
+        }
+        for schedule_date, fields in date_columns.items()
+        if fields
     ]
+    date_targets = {option["label"]: option["field"] for option in date_options}
+    navigate_on_change = JsCode(
+        f"""
+        function(params) {{
+            if (!params.node.rowPinned || params.colDef.field !== '{TIME_COLUMN}') {{
+                return;
+            }}
+            const targets = {json.dumps(date_targets, ensure_ascii=False)};
+            const target = targets[params.newValue];
+            if (target) {{
+                window.setTimeout(function() {{
+                    params.api.ensureColumnVisible(target, 'start');
+                }}, 0);
+            }}
+        }}
+        """
+    )
+    should_return = JsCode(
+        """
+        function({streamlitRerunEventTriggerName, eventData}) {
+            if (streamlitRerunEventTriggerName === 'cellValueChanged'
+                    && eventData && eventData.rowPinned === 'top') {
+                return false;
+            }
+            return true;
+        }
+        """
+    )
+    date_labels = [option["label"] for option in date_options]
     column_defs = [
         {
             "field": TIME_COLUMN,
             "headerName": "时间",
-            "editable": False,
+            "editable": JsCode(
+                "function(params) { return Boolean(params.node.rowPinned); }"
+            ),
             "pinned": "left",
             "lockPosition": "left",
-            "width": 135,
-            "minWidth": 135,
-            "maxWidth": 135,
-            "cellStyle": {"fontWeight": "600"},
+            "width": 112,
+            "minWidth": 112,
+            "maxWidth": 112,
+            "cellStyle": JsCode(
+                """
+                function(params) {
+                    if (params.node.rowPinned) {
+                        return {
+                            fontWeight: '600',
+                            backgroundColor: '#eaf2f8',
+                            cursor: 'pointer'
+                        };
+                    }
+                    return { fontWeight: '600' };
+                }
+                """
+            ),
+            "cellEditor": "agSelectCellEditor",
+            "cellEditorParams": {"values": date_labels},
         }
     ]
-    column_defs.extend(
-        {
-            "field": role,
-            "headerName": role,
-            "editable": True,
-            "minWidth": 115,
-            "flex": 1,
-        }
-        for role in role_columns
-    )
+    for schedule_date, fields in date_columns.items():
+        column_defs.append(
+            {
+                "headerName": display_schedule_date(schedule_date),
+                "marryChildren": True,
+                "children": [
+                    {
+                        "field": field,
+                        "headerName": role,
+                        "editable": True,
+                        "width": 82,
+                        "minWidth": 68,
+                        "maxWidth": 110,
+                    }
+                    for field, role in fields.items()
+                ],
+            }
+        )
     column_defs.append({"field": START_MINUTES_COLUMN, "hide": True})
 
     day_start_minutes = day_start_hour * 60
@@ -122,6 +183,9 @@ def edit_daily_grid(
     row_style = JsCode(
         f"""
         function(params) {{
+            if (params.node.rowPinned) {{
+                return {{ backgroundColor: '#f8f9fa' }};
+            }}
             const minute = Number(params.data.{START_MINUTES_COLUMN});
             const dayStart = {day_start_minutes};
             const nightStart = {night_start_minutes};
@@ -141,11 +205,17 @@ def edit_daily_grid(
             "suppressMovable": True,
         },
         "getRowStyle": row_style,
+        "onCellValueChanged": navigate_on_change,
+        "pinnedTopRowData": [
+            {TIME_COLUMN: date_labels[0] if date_labels else "定位日期"}
+        ],
         "singleClickEdit": True,
         "stopEditingWhenCellsLoseFocus": True,
         "suppressRowClickSelection": True,
-        "rowHeight": 29,
-        "headerHeight": 38,
+        "alwaysShowHorizontalScroll": True,
+        "rowHeight": 28,
+        "headerHeight": 34,
+        "groupHeaderHeight": 34,
     }
     response = AgGrid(
         frame,
@@ -154,16 +224,17 @@ def edit_daily_grid(
         update_mode=GridUpdateMode.VALUE_CHANGED,
         allow_unsafe_jscode=True,
         fit_columns_on_grid_load=False,
-        height=min(790, 44 + 29 * len(frame)),
+        height=min(820, 112 + 28 * len(frame)),
         theme="streamlit",
         key=key,
+        should_grid_return=should_return,
     )
     edited = pd.DataFrame(response["data"])
     edited = edited.reindex(columns=frame.columns)
     edited[START_MINUTES_COLUMN] = pd.to_numeric(
         edited[START_MINUTES_COLUMN], errors="coerce"
     ).fillna(frame[START_MINUTES_COLUMN]).astype(int)
-    return edited
+    return horizontal_grid_to_daily_grids(edited, date_grids, date_columns)
 
 
 st.title("💰 PJSK 工资计算器")
@@ -282,10 +353,10 @@ else:
 
 st.subheader("2. 核对并微调每日排班")
 st.caption(
-    "每次显示一个班组的一天。时间列固定在左侧且不能修改；双击或单击人员单元格即可改名，工资会自动重算。"
+    "一个班组的全部日期会横向排列。时间列固定在左侧；点击或双击表格第一行的日期即可快速定位，直接横向滚动也不会重新加载。"
 )
 
-control_columns = st.columns([1, 1, 2])
+control_columns = st.columns([1, 3])
 with control_columns[0]:
     viewed_team = st.selectbox(
         "查看班组",
@@ -293,14 +364,6 @@ with control_columns[0]:
         key=f"view_team_{file_fingerprint}",
     )
 with control_columns[1]:
-    available_dates = list(daily_grids[viewed_team])
-    viewed_date = st.selectbox(
-        "查看日期",
-        options=available_dates,
-        format_func=display_schedule_date,
-        key=f"view_date_{file_fingerprint}_{viewed_team}",
-    )
-with control_columns[2]:
     st.write("")
     st.write("")
     if st.button("恢复上传时的全部排班", use_container_width=False):
@@ -313,16 +376,16 @@ with control_columns[2]:
 
 revision = st.session_state[schedule_revision_key]
 grid_key = (
-    f"daily_grid_{file_fingerprint}_{viewed_team}_{viewed_date.isoformat()}_"
+    f"horizontal_grid_v2_{file_fingerprint}_{viewed_team}_"
     f"{revision}_{day_start_hour}_{night_start_hour}"
 )
-edited_grid = edit_daily_grid(
-    daily_grids[viewed_team][viewed_date],
+edited_date_grids = edit_horizontal_schedule(
+    daily_grids[viewed_team],
     key=grid_key,
     day_start_hour=day_start_hour,
     night_start_hour=night_start_hour,
 )
-daily_grids[viewed_team][viewed_date] = edited_grid
+daily_grids[viewed_team] = edited_date_grids
 st.session_state[schedule_state_key] = daily_grids
 
 records = daily_grids_to_records(daily_grids, time_step_minutes)

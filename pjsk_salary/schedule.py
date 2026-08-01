@@ -146,6 +146,68 @@ def daily_grids_to_blocks(
     return result
 
 
+def build_horizontal_grid(
+    date_grids: Mapping[dt.date, pd.DataFrame],
+) -> tuple[pd.DataFrame, dict[dt.date, dict[str, str]]]:
+    """Place every date side by side while sharing one fixed time column."""
+
+    if not date_grids:
+        return pd.DataFrame(columns=[TIME_COLUMN, START_MINUTES_COLUMN]), {}
+
+    first_frame = next(iter(date_grids.values()))
+    horizontal = first_frame[[TIME_COLUMN, START_MINUTES_COLUMN]].copy()
+    horizontal = horizontal.sort_values(START_MINUTES_COLUMN, kind="stable").reset_index(
+        drop=True
+    )
+    starts = horizontal[START_MINUTES_COLUMN]
+    date_columns: dict[dt.date, dict[str, str]] = {}
+
+    for date_index, (schedule_date, frame) in enumerate(sorted(date_grids.items())):
+        roles = [
+            str(column)
+            for column in frame.columns
+            if column not in {TIME_COLUMN, START_MINUTES_COLUMN}
+        ]
+        values_by_start = frame.set_index(START_MINUTES_COLUMN)
+        fields: dict[str, str] = {}
+        for role_index, role in enumerate(roles):
+            field = f"schedule_{date_index}_{role_index}"
+            fields[field] = role
+            horizontal[field] = starts.map(values_by_start[role]).fillna("")
+        date_columns[schedule_date] = fields
+
+    return horizontal, date_columns
+
+
+def horizontal_grid_to_daily_grids(
+    horizontal: pd.DataFrame,
+    templates: Mapping[dt.date, pd.DataFrame],
+    date_columns: Mapping[dt.date, Mapping[str, str]],
+) -> dict[dt.date, pd.DataFrame]:
+    """Apply edits from a horizontal grid back to its per-date grid model."""
+
+    edited = horizontal.copy()
+    edited[START_MINUTES_COLUMN] = pd.to_numeric(
+        edited[START_MINUTES_COLUMN], errors="coerce"
+    )
+    edited = edited.dropna(subset=[START_MINUTES_COLUMN]).copy()
+    edited[START_MINUTES_COLUMN] = edited[START_MINUTES_COLUMN].astype(int)
+    edited = edited.drop_duplicates(START_MINUTES_COLUMN, keep="last").set_index(
+        START_MINUTES_COLUMN
+    )
+
+    result: dict[dt.date, pd.DataFrame] = {}
+    for schedule_date, template in sorted(templates.items()):
+        frame = template.copy()
+        for field, role in date_columns.get(schedule_date, {}).items():
+            if field not in edited:
+                continue
+            values = edited[field]
+            frame[role] = frame[START_MINUTES_COLUMN].map(values).fillna("")
+        result[schedule_date] = frame
+    return result
+
+
 def infer_time_step(records: pd.DataFrame) -> int:
     """Infer a full-day grid interval while never becoming coarser than one hour."""
 
