@@ -4,7 +4,12 @@ import unittest
 
 from openpyxl import Workbook
 
-from pjsk_salary.parser import ScheduleParseError, parse_schedule_workbook
+from pjsk_salary.parser import (
+    ScheduleParseError,
+    parse_schedule_sheets,
+    parse_schedule_workbook,
+    read_schedule_workbook,
+)
 
 
 def make_schedule_workbook() -> bytes:
@@ -54,6 +59,15 @@ class ParserTests(unittest.TestCase):
         workbook.save(output)
         with self.assertRaises(ScheduleParseError):
             parse_schedule_workbook(output.getvalue())
+
+    def test_reparses_an_edited_schedule_grid(self):
+        sheets = read_schedule_workbook(make_schedule_workbook())
+        sheets["类五"].iat[2, 1] = "已修改"
+
+        parsed = parse_schedule_sheets(sheets)
+
+        edited = parsed.records[parsed.records["source_cell"] == "B3"].iloc[0]
+        self.assertEqual(edited["person"], "已修改")
 
 
 if __name__ == "__main__":

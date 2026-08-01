@@ -1,6 +1,12 @@
 """Core helpers for the PJSK salary calculator."""
 
-from .parser import ParsedWorkbook, ScheduleParseError, parse_schedule_workbook
+from .parser import (
+    ParsedWorkbook,
+    ScheduleParseError,
+    parse_schedule_sheets,
+    parse_schedule_workbook,
+    read_schedule_workbook,
+)
 from .salary import SalaryResult, SalaryValidationError, build_default_rates, calculate_salary
 
 __all__ = [
@@ -10,5 +16,7 @@ __all__ = [
     "ScheduleParseError",
     "build_default_rates",
     "calculate_salary",
+    "parse_schedule_sheets",
     "parse_schedule_workbook",
+    "read_schedule_workbook",
 ]

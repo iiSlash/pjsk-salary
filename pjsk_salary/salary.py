@@ -25,14 +25,58 @@ class SalaryResult:
     def total_salary(self) -> float:
         return float(self.summary["总工资"].sum())
 
+    @property
+    def payroll_summary(self) -> pd.DataFrame:
+        """Return only the fields needed to pay each person."""
+
+        return self.summary[["班组", "姓名", "总工时", "总工资"]].rename(
+            columns={"总工资": "应发工资"}
+        )
+
+    @property
+    def daily_detail(self) -> pd.DataFrame:
+        """Aggregate hourly records into a compact person/date/role audit view."""
+
+        daily = (
+            self.detail.groupby(
+                ["班组", "姓名", "日期", "岗位"],
+                sort=False,
+                as_index=False,
+            )
+            .agg(
+                白班工时=("白班工时", "sum"),
+                夜班工时=("夜班工时", "sum"),
+                总工时=("工时", "sum"),
+                应发工资=("工资", "sum"),
+            )
+        )
+        person_order = self.detail[["班组", "姓名"]].drop_duplicates(ignore_index=True)
+        person_order["_人员顺序"] = range(len(person_order))
+        daily = daily.merge(person_order, on=["班组", "姓名"], how="left")
+        daily = daily.sort_values(["_人员顺序", "日期"], kind="stable").drop(
+            columns="_人员顺序"
+        )
+        numeric_columns = ["白班工时", "夜班工时", "总工时", "应发工资"]
+        daily[numeric_columns] = daily[numeric_columns].astype(float).round(2)
+        return daily.reset_index(drop=True)
+
 
 def build_default_rates(
-    records: pd.DataFrame, day_rate: float = 20, night_rate: float = 30
+    records: pd.DataFrame,
+    day_rate: float | None = None,
+    night_rate: float | None = None,
 ) -> pd.DataFrame:
     unique_roles = records[["team", "role"]].drop_duplicates(ignore_index=True)
     rates = unique_roles.rename(columns={"team": "班组", "role": "岗位"})
-    rates["白班价"] = float(day_rate)
-    rates["夜班价"] = float(night_rate)
+    role_defaults = rates["岗位"].map(_default_rates_for_role)
+    rates["白班价"] = [
+        float(day_rate) if day_rate is not None else role_rate[0]
+        for role_rate in role_defaults
+    ]
+    rates["夜班价"] = [
+        float(night_rate) if night_rate is not None else role_rate[1]
+        for role_rate in role_defaults
+    ]
     return rates[RATE_COLUMNS]
 
 
@@ -127,8 +171,13 @@ def calculate_salary(
     )
     role_hours.columns = [f"{column}工时" for column in role_hours.columns]
     summary = role_hours.join(grouped, how="outer").reset_index()
+    person_order = detail[["team", "person"]].drop_duplicates(ignore_index=True)
+    person_order["_人员顺序"] = range(len(person_order))
+    summary = summary.merge(person_order, on=["team", "person"], how="left")
+    summary = summary.sort_values("_人员顺序", kind="stable").drop(
+        columns="_人员顺序"
+    )
     summary = summary.rename(columns={"team": "班组", "person": "姓名"})
-    summary = summary.sort_values(["班组", "总工资"], ascending=[True, False], kind="stable")
     numeric_columns = summary.columns.difference(["班组", "姓名"])
     summary[numeric_columns] = summary[numeric_columns].astype(float).round(2)
 
@@ -161,6 +210,15 @@ def calculate_salary(
     )
     detail_display["日期"] = pd.to_datetime(detail_display["日期"])
     return SalaryResult(summary.reset_index(drop=True), detail_display.reset_index(drop=True))
+
+
+def _default_rates_for_role(role: object) -> tuple[float, float]:
+    normalized = str(role).strip().casefold()
+    if normalized.startswith("跑") or normalized.startswith("s6"):
+        return 30.0, 35.0
+    if normalized.startswith("推"):
+        return 20.0, 25.0
+    return 20.0, 25.0
 
 
 def _split_shift_hours(

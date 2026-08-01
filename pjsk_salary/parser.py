@@ -4,7 +4,7 @@ import datetime as dt
 import io
 import re
 from dataclasses import dataclass
-from typing import BinaryIO
+from typing import BinaryIO, Mapping
 
 import pandas as pd
 
@@ -61,6 +61,14 @@ class ParsedWorkbook:
 def parse_schedule_workbook(source: bytes | bytearray | BinaryIO) -> ParsedWorkbook:
     """Parse horizontal date/time/role blocks from every worksheet in an xlsx file."""
 
+    return parse_schedule_sheets(read_schedule_workbook(source))
+
+
+def read_schedule_workbook(
+    source: bytes | bytearray | BinaryIO,
+) -> dict[str, pd.DataFrame]:
+    """Read every worksheet without assuming a header row."""
+
     stream: BinaryIO
     if isinstance(source, (bytes, bytearray)):
         stream = io.BytesIO(source)
@@ -71,6 +79,14 @@ def parse_schedule_workbook(source: bytes | bytearray | BinaryIO) -> ParsedWorkb
         sheets = pd.read_excel(stream, sheet_name=None, header=None, engine="openpyxl")
     except Exception as exc:  # openpyxl exposes several low-level exceptions
         raise ScheduleParseError(f"无法读取 Excel 文件：{exc}") from exc
+
+    return {str(sheet_name): frame for sheet_name, frame in sheets.items()}
+
+
+def parse_schedule_sheets(
+    sheets: Mapping[str, pd.DataFrame],
+) -> ParsedWorkbook:
+    """Parse already loaded or user-edited worksheet grids."""
 
     records: list[dict[str, object]] = []
     blocks: list[dict[str, object]] = []
